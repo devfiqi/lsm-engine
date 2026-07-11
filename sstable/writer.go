@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 
+	"github.com/devfiqi/lsm-engine/bloom"
 	"github.com/devfiqi/lsm-engine/skiplist"
 )
 
@@ -173,16 +174,86 @@ func (w *Writer) writeFooter(indexOffset, indexSize, bloomOffset, bloomSize int6
 
 /*
 Flushes a frozen memtable iterator to a new SSTable file at path.
+Builds a bloom filter over all keys and embeds it before the footer.
 */
-func Flush(path string, iter *skiplist.Iterator) (*Meta, error) {
+func Flush(path string, iter *skiplist.Iterator, expectedKeys int) (*Meta, error) {
+	// collect entries so we can build the bloom filter before writing
+	type kv struct {
+		key, value []byte
+		tomb       bool
+	}
+	var entries []kv
+	for iter.Next() {
+		entries = append(entries, kv{
+			key:   append([]byte(nil), iter.Key()...),
+			value: append([]byte(nil), iter.Value()...),
+			tomb:  iter.Tombstone(),
+		})
+	}
+
+	if expectedKeys <= 0 {
+		expectedKeys = len(entries)
+	}
+	if expectedKeys == 0 {
+		expectedKeys = 1
+	}
+
+	bf := bloom.New(expectedKeys, 0.01)
+	for _, e := range entries {
+		bf.Add(e.key)
+	}
+	bloomBytes := bf.Encode()
+
 	w, err := NewWriter(path)
 	if err != nil {
 		return nil, err
 	}
-	for iter.Next() {
-		if err := w.Append(iter.Key(), iter.Value(), iter.Tombstone()); err != nil {
+	for _, e := range entries {
+		if err := w.Append(e.key, e.value, e.tomb); err != nil {
 			return nil, err
 		}
 	}
-	return w.Finish()
+	return w.FinishWithBloom(bloomBytes)
+}
+
+/*
+Writes the sparse index, bloom filter, and footer, then closes the file.
+*/
+func (w *Writer) FinishWithBloom(bloomBytes []byte) (*Meta, error) {
+	if w.blockOpen && len(w.index) > 0 {
+		w.index[len(w.index)-1].size = w.offset - w.blockOffset
+	}
+
+	indexOffset := w.offset
+	if err := w.writeIndex(); err != nil {
+		return nil, err
+	}
+	indexSize := w.offset - indexOffset
+
+	bloomOffset := w.offset
+	n, err := w.buf.Write(bloomBytes)
+	w.offset += int64(n)
+	if err != nil {
+		return nil, err
+	}
+	bloomSize := int64(len(bloomBytes))
+
+	if err := w.writeFooter(indexOffset, indexSize, bloomOffset, bloomSize); err != nil {
+		return nil, err
+	}
+	w.offset += FooterSize
+
+	if err := w.buf.Flush(); err != nil {
+		return nil, err
+	}
+	if err := w.f.Close(); err != nil {
+		return nil, err
+	}
+
+	return &Meta{
+		Path:   w.f.Name(),
+		MinKey: w.minKey,
+		MaxKey: w.maxKey,
+		Size:   w.offset,
+	}, nil
 }
