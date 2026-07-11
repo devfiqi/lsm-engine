@@ -180,3 +180,70 @@ Closes the underlying file handle.
 func (r *Reader) Close() error {
 	return r.f.Close()
 }
+
+// ScanIterator walks every entry in the SSTable in sorted order.
+type ScanIterator struct {
+	r       *Reader
+	blockID int
+	block   []byte
+	br      *bytes.Reader
+	key     []byte
+	value   []byte
+	tomb    bool
+	valid   bool
+}
+
+/*
+Returns an iterator that streams all entries from the SSTable.
+*/
+func (r *Reader) NewScanIterator() *ScanIterator {
+	return &ScanIterator{r: r}
+}
+
+/*
+Advances to the next entry. Returns false when exhausted.
+*/
+func (it *ScanIterator) Next() bool {
+	for {
+		// try reading the next entry from the current block
+		if it.br != nil {
+			var hdr [9]byte
+			if _, err := io.ReadFull(it.br, hdr[:]); err == nil {
+				recType := hdr[0]
+				klen := binary.LittleEndian.Uint32(hdr[1:5])
+				vlen := binary.LittleEndian.Uint32(hdr[5:9])
+				k := make([]byte, klen)
+				v := make([]byte, vlen)
+				if _, err := io.ReadFull(it.br, k); err == nil {
+					if vlen > 0 {
+						io.ReadFull(it.br, v)
+					}
+					it.key = k
+					it.value = v
+					it.tomb = recType == RecordTypeDelete
+					it.valid = true
+					return true
+				}
+			}
+		}
+
+		// load next block
+		if it.blockID >= len(it.r.index) {
+			it.valid = false
+			return false
+		}
+		e := it.r.index[it.blockID]
+		it.blockID++
+		block := make([]byte, e.size)
+		if _, err := it.r.f.ReadAt(block, e.offset); err != nil {
+			it.valid = false
+			return false
+		}
+		it.br = bytes.NewReader(block)
+	}
+}
+
+func (it *ScanIterator) Key() []byte     { return it.key }
+func (it *ScanIterator) Value() []byte   { return it.value }
+func (it *ScanIterator) Tombstone() bool { return it.tomb }
+func (it *ScanIterator) Valid() bool     { return it.valid }
